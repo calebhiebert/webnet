@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>Title</title>
+</head>
+<body>
+<script crossorigin src="https://unpkg.com/@msgpack/msgpack"></script>
+<script>
+
+	async function getTicket() {
+		const res = await fetch("http://localhost:8899/ticket", {
+			method: "POST",
+			body: JSON.stringify({test: "test data"})
+		});
+
+		return await res.json();
+	}
+
+	async function connect() {
+		const ticket = await getTicket();
+
+		const connectionURL = `ws://localhost:8899/ws?ticket=${encodeURIComponent(ticket.ticket)}`;
+
+		console.log(connectionURL);
+
+		const ws = new WebSocket(connectionURL);
+
+		ws.addEventListener("open", (e) => {
+			console.log("Connection Open", e);
+		});
+
+		ws.addEventListener("message", async (e) => {
+			const buf = await e.data.arrayBuffer();
+
+			console.log(MessagePack.decode(buf));
+			console.log("Message Received", e);
+		});
+
+		ws.addEventListener("close", (e) => {
+			console.log("Connection Closed", e);
+		});
+
+		ws.addEventListener("error", (e) => {
+			console.log("Websocket Error", e);
+		});
+	}
+
+	connect();
+</script>
+</body>
+</html>

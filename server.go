@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	gonanoid "github.com/matoous/go-nanoid"
+	"github.com/vmihailenco/msgpack/v4"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -24,26 +25,61 @@ var wsupgrader = websocket.Upgrader{
 type Server struct {
 	ticketStore ITicketStore
 	handler     IServerHandler
+
+	userMX         sync.Mutex
+	connectedUsers map[string]*User
+	simpleCORS     bool
+}
+
+type Message struct {
+	Type string      `json:"t" msgpack:"t"`
+	Data interface{} `json:"d" msgpack:"d"`
 }
 
 type IServerHandler interface {
 	AuthenticateTicket(ticketData []byte) (bool, error)
-	AuthenticateConnection(user User, ticketData []byte) bool
+	AuthenticateConnection(user *User, ticketData []byte) bool
+	UserConnected(user *User)
+	UserDisconnected(user *User)
 }
 
 func NewServer(handler IServerHandler) *Server {
 	return &Server{
-		handler:     handler,
-		ticketStore: &MemoryTicketStore{},
+		handler:        handler,
+		simpleCORS:     true,
+		ticketStore:    &MemoryTicketStore{},
+		connectedUsers: map[string]*User{},
 	}
 }
 
-func (s *Server) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	if req.URL.Path == "/ticket" && req.Method == http.MethodPost {
-		s.handleTicket(res, req)
+func (s *Server) SetSimpleCORS(b bool) {
+	s.simpleCORS = b
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path == "/ticket" {
+		if s.simpleCORS {
+			s.writeCORSHeaders(&w)
+		}
+
+		if req.Method == "POST" {
+			s.handleTicket(w, req)
+		} else if req.Method == "OPTIONS" && s.simpleCORS {
+			return
+		}
 	} else if req.URL.Path == "/ws" {
-		s.handleWS(res, req)
+		if s.simpleCORS {
+			s.writeCORSHeaders(&w)
+		}
+
+		s.handleWS(w, req)
 	}
+}
+
+func (s *Server) writeCORSHeaders(w *http.ResponseWriter) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding")
 }
 
 func (s *Server) handleTicket(res http.ResponseWriter, req *http.Request) {
@@ -95,7 +131,7 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 	ticket := req.URL.Query().Get("ticket")
 
 	// Attempt to get the ticket data from the store
-	_, err := s.ticketStore.RetrieveTicket(ticket)
+	ticketData, err := s.ticketStore.RetrieveTicket(ticket)
 	if err != nil {
 		if err == ErrTicketNotFound {
 			res.WriteHeader(http.StatusUnauthorized)
@@ -108,7 +144,27 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// TODO do something with ticket data
+	// Create user object and add it to server
+	uid, _ := gonanoid.Nanoid()
+
+	user := &User{
+		ID:         uid,
+		TicketData: ticketData,
+		Data:       nil,
+		ClientData: nil,
+		writer:     make(chan []byte, 5),
+		reader:     make(chan []byte, 5),
+	}
+
+	ticketDataValid := s.handler.AuthenticateConnection(user, ticketData)
+
+	if !ticketDataValid {
+		jsb, _ := json.Marshal(map[string]interface{}{"error": "not authorized"})
+
+		res.WriteHeader(http.StatusForbidden)
+		_, _ = res.Write(jsb)
+		return
+	}
 
 	conn, err := wsupgrader.Upgrade(res, req, nil)
 	if err != nil {
@@ -116,12 +172,11 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	writer := make(chan []byte, 5)
 	conMX := sync.Mutex{}
 
 	// Message writer goroutine
 	go func() {
-		for m := range writer {
+		for m := range user.writer {
 			conMX.Lock()
 			err := conn.WriteMessage(websocket.BinaryMessage, m)
 			if err != nil {
@@ -156,7 +211,7 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 	// Message reader goroutine
 	go func() {
 		for {
-			t, _, err := conn.ReadMessage()
+			t, m, err := conn.ReadMessage()
 			if err != nil {
 				switch err.(type) {
 				case *websocket.CloseError:
@@ -183,6 +238,62 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 			if t != websocket.BinaryMessage {
 				fmt.Println("Incorrect message type", t)
 			}
+
+			user.reader <- m
 		}
+
+		// Once this point is reached, the connection has been closed
+		s.userDisconnected(user)
 	}()
+
+	s.addUser(user)
+}
+
+func (s *Server) addUser(user *User) {
+	s.userMX.Lock()
+	s.connectedUsers[user.ID] = user
+	s.userMX.Unlock()
+
+	s.handler.UserConnected(user)
+
+	user.mx.Lock()
+	user.ClientData = map[string]interface{}{
+		"_id": user.ID,
+	}
+	user.mx.Unlock()
+
+	s.syncUserState(user)
+	s.syncGameStateToUser(user)
+}
+
+func (s *Server) syncUserState(user *User) {
+	user.mx.Lock()
+	userData := user.ClientData
+	user.mx.Unlock()
+
+	// Send the user's own state to them
+	udBytes, err := msgpack.Marshal(Message{Type: "ud_state_sync", Data: userData})
+	if err != nil {
+		fmt.Println("Failed to marshal user state")
+	} else {
+		user.writer <- udBytes
+	}
+}
+
+func (s *Server) syncGameStateToUser(user *User) {
+	// Send the current game state to the user
+	gsBytes, err := msgpack.Marshal(Message{Type: "gs_sync", Data: "imaginary state"})
+	if err != nil {
+		fmt.Println("Failed to marshal game state")
+	} else {
+		user.writer <- gsBytes
+	}
+}
+
+func (s *Server) userDisconnected(user *User) {
+	s.userMX.Lock()
+	delete(s.connectedUsers, user.ID)
+	s.userMX.Unlock()
+
+	s.handler.UserDisconnected(user)
 }
