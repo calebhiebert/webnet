@@ -22,13 +22,19 @@ var wsupgrader = websocket.Upgrader{
 	},
 }
 
+const TICKS_PER_SECOND = 60.0
+
 type Server struct {
 	ticketStore ITicketStore
 	handler     IServerHandler
 
+	state          interface{}
 	userMX         sync.Mutex
 	connectedUsers map[string]*User
 	simpleCORS     bool
+	running        bool
+
+	prevTick time.Time
 }
 
 type Message struct {
@@ -36,20 +42,38 @@ type Message struct {
 	Data interface{} `json:"d" msgpack:"d"`
 }
 
+type UserMessage struct {
+	*Message
+	User *User
+}
+
 type IServerHandler interface {
 	AuthenticateTicket(ticketData []byte) (bool, error)
 	AuthenticateConnection(user *User, ticketData []byte) bool
 	UserConnected(user *User)
 	UserDisconnected(user *User)
+	Tick(delta float64, events []UserMessage)
 }
 
-func NewServer(handler IServerHandler) *Server {
-	return &Server{
+type IServerAPI interface {
+	RemoveUser(id, reason string)
+	UpdateState(newState interface{})
+}
+
+func NewServer(handler IServerHandler, state interface{}) *Server {
+	s := &Server{
 		handler:        handler,
 		simpleCORS:     true,
 		ticketStore:    &MemoryTicketStore{},
 		connectedUsers: map[string]*User{},
+		prevTick:       time.Now(),
+		running:        true,
+		state:          state,
 	}
+
+	s.startGameloop()
+
+	return s
 }
 
 func (s *Server) SetSimpleCORS(b bool) {
@@ -153,7 +177,6 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 		Data:       nil,
 		ClientData: nil,
 		writer:     make(chan []byte, 5),
-		reader:     make(chan []byte, 5),
 	}
 
 	ticketDataValid := s.handler.AuthenticateConnection(user, ticketData)
@@ -239,7 +262,16 @@ func (s *Server) handleWS(res http.ResponseWriter, req *http.Request) {
 				fmt.Println("Incorrect message type", t)
 			}
 
-			user.reader <- m
+			var msg Message
+
+			err = msgpack.Unmarshal(m, &msg)
+			if err != nil {
+				fmt.Println("failed to unmarshal msg", err)
+			} else {
+				user.mx.Lock()
+				user.messages = append(user.messages, msg)
+				user.mx.Unlock()
+			}
 		}
 
 		// Once this point is reached, the connection has been closed
@@ -296,4 +328,81 @@ func (s *Server) userDisconnected(user *User) {
 	s.userMX.Unlock()
 
 	s.handler.UserDisconnected(user)
+}
+
+func (s *Server) tick(delta float64) {
+
+	// Lock the user's map so it can't be modified during processing
+	s.userMX.Lock()
+
+	// Create a slice to store all events received from users
+	var events []UserMessage
+
+	// Loop over each connected user to grab their incoming messages
+	for _, u := range s.connectedUsers {
+
+		// Lock the individual user's data so it can't be modified during processing
+		u.mx.Lock()
+
+		// Range over each user message received since the last tick
+		for _, msg := range u.messages {
+			switch msg.Type {
+
+			// Capture events and stick them into the events slice
+			// TODO figure out a nicer way to serialize these bad boys
+			case "event":
+				events = append(events, UserMessage{
+					Message: &msg,
+					User:    u,
+				})
+
+			default:
+				fmt.Println("Unknown client message type", msg.Type)
+			}
+		}
+
+		// Clear the user's messages slice, because we've drained all the messages
+		u.messages = nil
+		u.mx.Unlock()
+	}
+	s.userMX.Unlock()
+
+	// Run the user provided tick function
+	s.handler.Tick(delta, events)
+}
+
+func (s *Server) startGameloop() {
+	go func() {
+		for {
+			if !s.running {
+				break
+			}
+
+			// Capture the time at the start of the tick
+			start := time.Now()
+
+			// Calculate time time (in seconds) since the end of the previous tick
+			delta := float64(start.Sub(s.prevTick).Nanoseconds()) / 1000000000.0
+
+			// Perform the server tick
+			s.tick(delta)
+
+			// Calculate how long the tick took
+			duration := time.Now().Sub(start)
+
+			// Figure out how long we should wait until ticking again
+			// Note: time.Sleep is not suuuuuuper accurate, and I'm pretty sure there are better ways to do this
+			// But I did not look them up
+			sleepTime := (1.0/TICKS_PER_SECOND)*1000000000.0 - float64(duration.Nanoseconds())
+
+			s.prevTick = time.Now()
+
+			// Sleep time will be < 0 if the tick took longer than the allowed time
+			// in this case we don't want to wait, because some catching up probably needs to be done
+			// so the next tick should start asap
+			if sleepTime > 0 {
+				time.Sleep(time.Duration(sleepTime))
+			}
+		}
+	}()
 }

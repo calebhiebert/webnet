@@ -2,6 +2,9 @@ package web_net
 
 type DummyServerHandler struct{}
 
+func (d *DummyServerHandler) Tick(delta float64, events []UserMessage) {
+}
+
 func (d *DummyServerHandler) UserConnected(user *User) {
 
 }

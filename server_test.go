@@ -10,7 +10,7 @@ import (
 )
 
 func TestTicket(t *testing.T) {
-	s := NewServer(&DummyServerHandler{})
+	s := NewServer(&DummyServerHandler{}, nil)
 
 	jsb, _ := json.Marshal(map[string]string{"test_data": "test"})
 
